@@ -1,0 +1,683 @@
+#!/usr/bin/python3
+# coding=utf-8
+
+from __future__ import print_function
+
+import smbus
+import sys
+import time
+import crcmod
+import json
+from collections import namedtuple
+from ws4py.client.tornadoclient import TornadoWebSocketClient
+from tornado import ioloop
+from tornado import gen
+from OpenSSL import rand
+import base64
+import math
+import socket
+import os.path
+from traceback import print_exc
+
+# https://github.com/aykevl/ufloat8
+import ufloat8
+
+# for RPI version 1, use "bus = smbus.SMBus(0)”
+bus = smbus.SMBus(1)
+
+# ATtiny84 I2C address
+I2C_ADDRESS          = 0x3d
+DOMOD_URL            = 'wss://domo.aykevl.nl/api/ws/device'
+LOG_INTERVAL         = 60 * 5 # 5 minutes
+PROBE_COUNT          = 10
+DEFAULT_NAME         = 'Domo'
+CONFFILE             = os.path.expanduser('~/.config/domo.json')
+COLOR_READ_INTERVAL  = 5.0
+COMMAND_LOOP_TIMEOUT = 0.150
+
+def randomString(n):
+    b = rand.bytes(int(math.ceil(n/3.0*4)))
+    return str(base64.b64encode(b, altchars=b'-_')[:n])
+
+def getName():
+    return DEFAULT_NAME + ' ' + socket.gethostname()
+
+
+TYPE_GETTER2 = 0b00000000
+TYPE_GETTER4 = 0b01000000
+TYPE_SETTER2 = 0b10000000
+TYPE_SETTER4 = 0b11000000
+
+class Param:
+    def __init__(self, command, inputMultiplier=None, maxValue=None):
+        self.command = command
+        # inputMultiplier: the setter value is often scaled in 0-1, this is the
+        # value the input must be multiplied with to get the microcontroller
+        # integer value.
+        self.inputMultiplier = inputMultiplier
+        self.maxValue = maxValue
+
+    def getter(self):
+        return self.command | self.TYPE_GETTER
+
+    def setter(self):
+        return self.command | self.TYPE_SETTER
+
+class Param2(Param):
+    length = 2
+    TYPE_GETTER = TYPE_GETTER2
+    TYPE_SETTER = TYPE_SETTER2
+
+class Param4(Param):
+    length = 4
+    TYPE_GETTER = TYPE_GETTER4
+    TYPE_SETTER = TYPE_SETTER4
+
+
+params = {
+    #'hue':        Param2(0x01, 255, 0xff),
+    #'saturation': Param2(0x02, 255, 0xff),
+    #'value':      Param2(0x03, 255, 0xff),
+    #'value4':     Param4(0x03),
+    'looptime':   Param2(0x04, 1,   0xffff),   # input is in seconds
+    'tempNow':    Param2(0x11),                # current temperature
+    'tempAvg':    Param2(0x12),                # average temperature over 2.5s
+    'tempRaw':    Param2(0x13),                # raw value (0-1023) read from the pin
+    'color':      Param4(0x05, 1, 0xffffffff), # raw color value (32-bit value)
+    'test2':      Param2(0x20),
+    'test4':      Param4(0x20),
+}
+
+crc8CCITT = crcmod.mkCrcFun(0x107, 0x00, False)
+
+# Utility function
+def calcTemperature(rawValue):
+    # temperature is in centidegrees (100s of a degree), where 0 equals -55°C
+    temp = (rawValue - 5500) / 100.0
+    if temp > 350 or temp < -50:
+        # these are no room temperatures, but invalid reads
+        return None
+    return temp
+
+class DeviceController:
+    ValueToSet = namedtuple('ValueToSet', ('value', 'callback'))
+    def __init__(self, address):
+        self.ioloop = ioloop.IOLoop.instance()
+        self.valuesToSet = {}
+        self.commandLoopRunning = False
+
+    def startCommandLoop(self):
+        if self.commandLoopRunning:
+            return
+        self.commandLoopRunning = True
+        try:
+            # start with a very small delay, to do it after the current callback
+            # finishes
+            self.ioloop.add_timeout(time.time()+0.010, self.commandLoop)
+        except:
+            print('ERROR while starting:')
+            print_exc()
+
+    def commandLoop(self):
+        try:
+            if len(self.valuesToSet) == 0:
+                self.commandLoopRunning = False
+                return
+
+            # take the first command we get
+            for name in self.valuesToSet:
+                valueToSet = self.valuesToSet[name]
+                print('setting %s=%08x' % (name, valueToSet.value))
+                self.sendCommand(name, valueToSet.value)
+                if valueToSet.callback is not None:
+                    valueToSet.callback()
+                del self.valuesToSet[name]
+                break
+
+            # wait a bit between commands
+            self.ioloop.add_timeout(time.time()+COMMAND_LOOP_TIMEOUT, self.commandLoop)
+        except:
+            # for some reason no error is printed in an add_timeout
+            print('ERROR in command loop:')
+            print_exc()
+
+    def setStatus(self, name, value, callback=None):
+        self.valuesToSet[name] = self.ValueToSet(value, callback)
+        self.startCommandLoop()
+
+    def sendCommand(self, name, value, multiply=True):
+        param = params[name]
+        if multiply:
+            rawvalue = int(value * param.inputMultiplier)
+        else:
+            rawvalue = int(value)
+
+        buf = []
+        for i in range(param.length):
+            # get the nth byte
+            b = rawvalue % 256
+            rawvalue //= 256
+            buf.append(int(b))
+        crc = crc8CCITT(bytes([param.setter()]+buf))
+        buf.append(crc)
+        bus.write_i2c_block_data(I2C_ADDRESS, param.setter(), buf)
+
+    def readStatusRaw(self, name):
+        param = params[name]
+        bus.write_i2c_block_data(I2C_ADDRESS, param.getter(), [crc8CCITT(bytes([param.getter()]))])
+        # Wait for start byte: reads before data is ready are always 0xff.
+        results = [0xff] * param.length
+        time.sleep(0.1)
+        #while results[0] == 0xff:
+        results[0] = bus.read_byte(I2C_ADDRESS)
+        for i in range(1, param.length):
+            results[i] = bus.read_byte(I2C_ADDRESS)
+        crc = bus.read_byte(I2C_ADDRESS)
+        data = bytes([param.getter()] + results)
+        crc2 = crc8CCITT(data)
+        if crc != crc2:
+            print(map(hex, results), crc, crc2)
+            return None
+        result = 0
+        for i in range(len(results)):
+            result += results[i] << (i*8)
+        return result
+
+    def readStatus(self, name, tries=3):
+        for i in range(tries):
+            if i > 0:
+                time.sleep(0.11)
+
+            try:
+                value = self.readStatusRaw(name)
+            except IOError:
+                print('ERROR: Device not connected')
+                return None, False
+
+            if value is not None:
+                return value, True
+
+        return None, True
+
+
+    def readTemperatureNow(self):
+        temperatures = []
+        totalCount = 0
+        start = time.time()
+        for i in range(PROBE_COUNT):
+            value = None
+            while True:
+                try:
+                    totalCount += 1
+                    value = self.readStatusRaw('tempNow')
+                except IOError:
+                    print('ERROR: Device not connected')
+                    return None
+                if totalCount > PROBE_COUNT*2:
+                    print('ERROR: many reads return invalid data')
+                    return None
+                time.sleep(0.01)
+                if value is not None:
+                    break
+                # invalid value: sleep a bit longer just in case
+                time.sleep(0.4)
+            temp = calcTemperature(value)
+            if temp is None:
+                print('ERROR: invalid data from device (sensor not connected?)')
+                return None
+            temperatures.append(temp)
+        if totalCount > int(PROBE_COUNT*1.2):
+            print('totalCount is higher than usual: ', totalCount)
+        temperatures.sort()
+        print(temperatures)
+        return temperatures[PROBE_COUNT // 2]
+
+    def readTemperatureAvg(self):
+        value, ok = self.readStatus('tempAvg')
+        if value is not None:
+            return calcTemperature(value)
+
+        # could not read temperature
+        return None
+
+    def readColorRaw(self, tries=3):
+        return self.readStatus('color', tries=tries)
+
+    def readColor(self):
+        rawValue, ok = self.readColorRaw()
+        if rawValue is None:
+            return None, ok
+        return Color.fromRawValue(rawValue), ok
+
+class Color:
+    FLAG_WHITE       = 0b10000000
+    FLAG_HUETIME     = 0b01000000
+    MODE_MASK        = 0b00000011
+    MODES = {
+        'rgb':         0b00000000,
+        'hsv':         0b00000001,
+        'hsv-max':     0b00000010,
+        'undefined-1': 0b00000011,
+    }
+    MODE_CONSTANTS = {v: n for n, v in MODES.items()}
+
+
+    def __init__(self, data):
+        if not isinstance(data, dict):
+            raise ValueError('data argument must be an object')
+        self.data = data
+
+    def getFloat(self, name, default=0.0):
+        try:
+            return float(self.data.get(name, default))
+        except ValueError:
+            return default
+
+    def getString(self, name, default=''):
+        try:
+            return str(self.data.get(name, default))
+        except ValueError:
+            return default
+
+    def getBool(self, name, default=False):
+        try:
+            return bool(self.data.get(name, default))
+        except ValueError:
+            return default
+
+    @classmethod
+    def fromRawValue(cls, rawValue):
+        #print('raw value 1: %08x' % rawValue)
+        data = {}
+        bytes = []
+        for i in range(4):
+            bytes.append(int((rawValue& 0xff000000) >> 24))
+            rawValue <<= 8
+        data['mode'] = cls.MODE_CONSTANTS[bytes[0] & cls.MODE_MASK]
+        data['isWhite'] = bool(bytes[0] & cls.FLAG_WHITE)
+        data['looping'] = bool(bytes[0] & cls.FLAG_HUETIME)
+        if data['mode'] in ['hsv', 'hsv-max']:
+            if data['looping']:
+                data['time'] = ufloat8.decode(bytes[1])/4.0
+            else:
+                data['hue'] = bytes[1] / 255.0
+            data['saturation'] = bytes[2] / 255.0
+            data['value'] = bytes[3] / 255.0
+        elif data['mode'] == 'rgb':
+            data['red'], data['green'], data['blue'] = map(lambda v: v/255.0, bytes[1:])
+        return Color(data)
+
+    @property
+    def rawValue(self):
+        type = self.MODES[self.getString('mode')]
+        if self.getBool('isWhite'):
+            type |= self.FLAG_WHITE
+        if self.getBool('looping'):
+            type |= self.FLAG_HUETIME
+            hueOrTime = ufloat8.encode(int(round(self.getFloat('time')*4.0)))
+        else:
+            hueOrTime = int(round(self.getFloat('hue')* 255))
+
+        saturation = int(round(self.getFloat('saturation') * 255))
+        value      = int(round(self.getFloat('value')      * 255))
+
+        rawValue = (type << 24) | (hueOrTime << 16) | (saturation << 8) | value
+        #print('raw value 2: %08x' % rawValue)
+        return rawValue
+
+    def setHue(self, hue):
+        assert isinstance(hue, float) and 0 <= hue <= 1
+        self.data['hue'] = hue
+        self.data['looping'] = False
+        self.ensureHSV()
+    def setTime(self, time):
+        assert isinstance(time, float) and 0 <= time
+        self.data['time'] = time
+        self.data['looping'] = True
+        self.ensureHSV()
+    def setSaturation(self, saturation):
+        assert isinstance(saturation, float) and 0 <= saturation <= 1
+        self.data['saturation'] = saturation
+        self.ensureHSV()
+    def setValue(self, value):
+        assert isinstance(value, float) and 0 <= value <= 1
+        self.data['value'] = value
+        self.ensureHSV()
+    def setMode(self, mode):
+        assert mode in self.MODES
+        self.data['mode'] = mode
+    def ensureHSV(self):
+        if self.getString('mode') not in ['hsv', 'hsv-max']:
+            self.data['mode'] = 'hsv'
+
+
+class DomoConnection(TornadoWebSocketClient):
+    def opened(self):
+        try:
+            self.domo.opened()
+        except:
+            print('ERROR in opened:')
+            print_exc()
+
+    def received_message(self, message):
+        try:
+            self.domo.received_message(message)
+        except:
+            print('ERROR in received_message:')
+            print_exc()
+
+    def closed(self, code, reason=None):
+        try:
+            self.domo.closed(code)
+        except:
+            print('ERROR in opened:')
+            print_exc()
+
+
+class Domo:
+    def __init__(self, url):
+        self.verifiedTime = False
+        self.shutdown = False
+        self.reconnectCount = 0
+        self.url = url
+        self.ioloop = ioloop.IOLoop.instance()
+        self.device = DeviceController(I2C_ADDRESS)
+        self.connected = False
+
+        self.color = None
+        self.colorRaw = None
+        self.colorLastUpdate = 0
+        self.readColorInterval()
+
+        if os.path.isfile(CONFFILE):
+            self.conf = json.load(open(CONFFILE, 'r'))
+        else:
+            self.conf = {
+                'name':       getName(),
+                'serial':     randomString(16),
+                'passphrase': randomString(24),
+            }
+            json.dump(self.conf, open(CONFFILE, 'w'))
+
+        self.reconnect()
+
+    def opened(self):
+        self.connected = True
+        self.ws.send(json.dumps({
+            'message':    'connect',
+            'name':       self.conf['name'],
+            'serial':     self.conf['serial'],
+            'passphrase': self.conf['passphrase'],
+        }))
+        self.sendColor()
+        self.logger()
+        if self.reconnectCount > 0:
+            print('Connected.')
+        self.reconnectCount = 0
+
+    def closed(self, code):
+        self.connected = False
+        print('Closed websocket:', code)
+        self.stopLogger()
+        self.ws = None
+        if not self.shutdown:
+            self.reconnectCount += 1
+            delay = min(60, 0.5*(2**self.reconnectCount)) # 1s, 2s, 4s,... 60s
+            print('Reconnecting in %.3fs...' % delay)
+            reconnectTime = time.time() + delay
+            try:
+                self.ioloop.add_timeout(reconnectTime, self.reconnect)
+            except:
+                print('ERROR in closed() add_timeout:')
+                print_exc()
+
+    def close(self):
+        self.shutdown = True
+        if not self.ws.terminated:
+            self.ws.close()
+
+    def reconnect(self):
+        try:
+            if self.shutdown:
+                return
+            self.ws = DomoConnection(self.url)
+            self.ws.domo = self
+            try:
+                self.ws.connect()
+            except ws4py.exc.HandshakeError:
+                print('Reconnect failed.')
+        except:
+            # for some reason no error is printed in an add_timeout
+            print('ERROR while reconnecting (exiting reconnect):')
+            print_exc()
+
+    def received_message(self, message):
+        msg = json.loads(str(message))
+        if msg['message'] == 'time':
+            if abs(msg['value'] - time.time()) < 60:
+                # time is within some reasonable margin
+                self.verifiedTime = True
+            else:
+                print('WARNING: time not in sync')
+
+        elif msg['message'] == 'actuator':
+            if msg['name'] == 'color':
+                color = Color(msg['value'])
+                print('setting color:', color.data)
+                def callback():
+                    self.color = color
+                    self.colorRaw = color.rawValue
+                    self.colorLastUpdate = time.time()
+                    self.ioloop.remove_timeout(self.colorTimeout)
+                    self.readColorInterval()
+                self.device.setStatus('color', color.rawValue, callback)
+            else:
+                print('UNKNOWN actuator: %s: %s' % (msg['name'], repr(msg['value'])))
+        else:
+            print('UNKNOWN message:', repr(msg))
+
+    def sendValue(self, name, value, time, dataType):
+        if not self.verifiedTime:
+            print('Not verified time! I cannot make sure that the time on the server and client is about the same.')
+            return
+
+        self.ws.send(json.dumps({
+            'message':  'sensorLog',
+            'name':     name,
+            'value':    value,
+            'time':     time,
+            'type':     dataType,
+            'interval': LOG_INTERVAL,
+        }))
+
+    def log(self, nowUnix=None, send=False):
+        if nowUnix is None:
+            nowUnix = time.time()
+        now = time.localtime(nowUnix)
+        temperature = self.device.readTemperatureAvg()
+        if temperature is None:
+            tempString = '<none>'
+        else:
+            tempString = '%2.2f°C' % temperature
+        print('%02d:%02d %s' % (now.tm_hour, now.tm_min, tempString))
+        if send and temperature is not None:
+            self.sendValue('temp', temperature, nowUnix, 'temperature')
+
+    def logger(self):
+        lastLog = int(time.time()) // LOG_INTERVAL * LOG_INTERVAL
+        nextLog = lastLog + LOG_INTERVAL
+        def doLogger():
+            try:
+                self.log(nextLog, send=True)
+                self.logger()
+            except:
+                # for some reason no error is printed in an add_timeout
+                print('ERROR in doLogger:')
+                print_exc()
+        try:
+            self.loggerTimeout = self.ioloop.add_timeout(nextLog, doLogger)
+        except:
+            print('ERROR in logger:')
+            print_exc()
+
+    def stopLogger(self):
+        if self.loggerTimeout is None:
+            return
+        self.ioloop.remove_timeout(self.loggerTimeout)
+        self.loggerTimeout = None
+
+    def readColorInterval(self):
+        oldRawColor = self.colorRaw
+
+        colorRaw, ok = self.device.readColorRaw(tries=1)
+        color = None
+        if not ok:
+            # device not connected
+            self.color = None
+            self.colorRaw = None
+        elif colorRaw is None:
+            # could not read value (try again)
+            pass
+        else:
+            # value read from device!
+            self.colorRaw = colorRaw
+            self.color = Color.fromRawValue(self.colorRaw)
+
+        if oldRawColor != self.colorRaw:
+            if oldRawColor is not None:
+                self.colorLastUpdate = time.time()
+            if self.connected:
+                print('color changed:', color.data if color is not None else None)
+                self.sendColor()
+
+        try:
+            now = time.time()
+            interval = min(COLOR_READ_INTERVAL, 0.100 + (now - self.colorLastUpdate) / 5)
+            self.colorTimeout = self.ioloop.add_timeout(now+interval, self.readColorInterval)
+        except:
+            print('ERROR in readColorInterval:')
+            print_exc()
+
+    def sendColor(self):
+        data = None
+        if self.color is not None:
+            data = self.color.data
+        self.ws.send(json.dumps({
+            'message': 'actuator',
+            'name':    'color',
+            'value':   data,
+        }))
+
+
+
+def runDomo():
+    domo = Domo(DOMOD_URL)
+    print('       Temperature:')
+    domo.log()
+    loop = ioloop.IOLoop.instance()
+    try:
+        loop.start()
+    except KeyboardInterrupt:
+        domo.close()
+    except:
+        print('ERROR in mainloop:')
+        print_exc()
+
+
+def usage(out=sys.stderr):
+    print('Usage: %s <command> <arg>' % sys.argv[0], file=out)
+    print('Commands:', ', '.join(params.keys()), file=out)
+
+def main():
+    if len(sys.argv) < 2:
+        runDomo() # never returns
+        return
+
+    device = DeviceController(I2C_ADDRESS)
+
+    command = sys.argv[1]
+    arg = None
+    if command in ['-h', '--help', 'help']:
+        usage(sys.stdout)
+    elif command in params and len(sys.argv) == 3:
+        try:
+            arg = int(sys.argv[2], 0)
+        except ValueError:
+            print('Could not parse argument.', file=sys.stderr)
+            usage()
+            return
+        param = params[command]
+        if arg < 0 or arg > param.maxValue:
+            print('arg must be in range 0-%d' % param.maxValue, file=out)
+            return
+        device.sendCommand(command, arg, multiply=False)
+    elif command in ['hue', 'time', 'saturation', 'value', 'mode'] and len(sys.argv) == 3:
+        if command == 'mode':
+            arg = sys.argv[2]
+        else:
+            try:
+                arg = float(sys.argv[2])
+            except ValueError:
+                print('Could not parse argument.', file=sys.stderr)
+                usage()
+                return
+        color, ok = device.readColor()
+        if command == 'hue':
+            color.setHue(arg)
+        elif command == 'time':
+            color.setTime(arg)
+        elif command == 'saturation':
+            color.setSaturation(arg)
+        elif command == 'value':
+            color.setValue(arg)
+        elif command == 'mode':
+            color.setMode(arg)
+        else:
+            raise RuntimeError('command not specified (unreachable?)')
+        print(color.data)
+        print(Color.fromRawValue(color.rawValue).data)
+        device.sendCommand('color', color.rawValue)
+
+    elif command in params or command in ['temp', 'tempDbg']:
+        if len(sys.argv) != 2:
+            usage()
+            return
+        if command in ['temp', 'tempAvg', 'tempNow']:
+            if command == 'tempNow':
+                temp = device.readTemperatureNow()
+            else:
+                temp = device.readTemperatureAvg()
+            if temp is None:
+                temp = '<none>'
+            else:
+                temp = '%.2f°C' % temp
+            print('temp:', temp)
+        elif command == 'tempDbg':
+            while True:
+                n, online = device.readStatus('tempRaw', tries=1)
+                print(('%4s' % n) + ('' if online else ' (offline)'))
+                time.sleep(0.1)
+        elif command == 'color':
+            color, ok = device.readColor()
+            if color:
+                print('color: %08x' % color.rawValue, color.data)
+            else:
+                print('color: <none>')
+        else:
+            value, ok = device.readStatus(command)
+            if value is None:
+                value = '<none>'
+            else:
+                if command in ['test', 'test2', 'test4']:
+                    value = '%08x' % value
+                else:
+                    value = str(value)
+            print('%s: %s' % (command, value))
+    else:
+        print('Unknown command: ' + command, file=sys.stderr)
+        usage()
+
+
+
+if __name__ == '__main__':
+    main()
