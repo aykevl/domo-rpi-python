@@ -164,19 +164,12 @@ class DeviceController:
 
     def readStatusRaw(self, name):
         param = params[name]
-        bus.write_i2c_block_data(I2C_ADDRESS, param.getter(), [crc8CCITT(bytes([param.getter()]))])
-        # Wait for start byte: reads before data is ready are always 0xff.
-        results = [0xff] * param.length
-        time.sleep(0.1)
-        #while results[0] == 0xff:
-        results[0] = bus.read_byte(I2C_ADDRESS)
-        for i in range(1, param.length):
-            results[i] = bus.read_byte(I2C_ADDRESS)
-        crc = bus.read_byte(I2C_ADDRESS)
-        data = bytes([param.getter()] + results)
-        crc2 = crc8CCITT(data)
+        buf = bus.read_i2c_block_data(I2C_ADDRESS, param.getter())
+        results = buf[:param.length]
+        crc = buf[param.length]
+        crc2 = crc8CCITT(bytes([param.getter()] + results))
         if crc != crc2:
-            print(map(hex, results), crc, crc2)
+            print('checksum problem', list(map(hex, results)), crc, crc2)
             return None
         result = 0
         for i in range(len(results)):
