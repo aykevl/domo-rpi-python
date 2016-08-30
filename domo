@@ -3,7 +3,7 @@
 
 from __future__ import print_function
 
-import smbus
+import spidev
 import sys
 import time
 import crcmod
@@ -22,11 +22,9 @@ from traceback import print_exc
 # https://github.com/aykevl/ufloat8
 import ufloat8
 
-# for RPI version 1, use "bus = smbus.SMBus(0)”
-bus = smbus.SMBus(1)
+spi = spidev.SpiDev()
+spi.open(0, 0)
 
-# ATtiny84 I2C address
-I2C_ADDRESS          = 0x3d
 DOMOD_URL            = 'wss://domo.aykevl.nl/api/ws/device'
 LOG_INTERVAL         = 60 * 5 # 5 minutes
 PROBE_COUNT          = 10
@@ -101,7 +99,7 @@ def calcTemperature(rawValue):
 
 class DeviceController:
     ValueToSet = namedtuple('ValueToSet', ('value', 'callback'))
-    def __init__(self, address):
+    def __init__(self):
         self.ioloop = ioloop.IOLoop.instance()
         self.valuesToSet = {}
         self.commandLoopRunning = False
@@ -160,11 +158,18 @@ class DeviceController:
             buf.append(int(b))
         crc = crc8CCITT(bytes([param.setter()]+buf))
         buf.append(crc)
-        bus.write_i2c_block_data(I2C_ADDRESS, param.setter(), buf)
+        spi.xfer([param.setter()])
+        for c in buf:
+            time.sleep(0.001)
+            spi.xfer([c])
 
     def readStatusRaw(self, name):
         param = params[name]
-        buf = bus.read_i2c_block_data(I2C_ADDRESS, param.getter())
+        spi.xfer([param.getter()])
+        buf = [0xff] * (param.length+1)
+        for i in range(len(buf)):
+            time.sleep(0.001)
+            buf[i] = spi.xfer([0])[0]
         results = buf[:param.length]
         crc = buf[param.length]
         crc2 = crc8CCITT(bytes([param.getter()] + results))
@@ -374,7 +379,7 @@ class Domo:
         self.reconnectCount = 0
         self.url = url
         self.ioloop = ioloop.IOLoop.instance()
-        self.device = DeviceController(I2C_ADDRESS)
+        self.device = DeviceController()
         self.connected = False
 
         self.color = None
@@ -586,7 +591,7 @@ def main():
         runDomo() # never returns
         return
 
-    device = DeviceController(I2C_ADDRESS)
+    device = DeviceController()
 
     command = sys.argv[1]
     arg = None
