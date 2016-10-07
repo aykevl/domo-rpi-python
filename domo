@@ -452,7 +452,7 @@ class Domo:
     def received_message(self, message):
         msg = json.loads(str(message))
         if msg['message'] == 'time':
-            if abs(msg['value'] - time.time()) < 60:
+            if abs(msg['timestamp'] - time.time()) < 60:
                 # time is within some reasonable margin
                 self.verifiedTime = True
             else:
