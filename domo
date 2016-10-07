@@ -163,6 +163,15 @@ class DeviceController:
             time.sleep(0.001)
             spi.xfer([c])
 
+    def resync(self):
+        while True:
+            val = spi.xfer([0])[0]
+            print('resync:', val)
+            try:
+                time.sleep(0.5)
+            except KeyboardInterrupt:
+                break
+
     def readStatusRaw(self, name):
         param = params[name]
         spi.xfer([param.getter()])
@@ -597,6 +606,8 @@ def main():
     arg = None
     if command in ['-h', '--help', 'help']:
         usage(sys.stdout)
+    elif command == 'resync':
+        device.resync()
     elif command in params and len(sys.argv) == 3:
         try:
             arg = int(sys.argv[2], 0)
